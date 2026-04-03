@@ -25,6 +25,7 @@ const TensorInfo = struct {
             2 => .Q4_0,
             3 => .Q4_1,
             8 => .Q8_0,
+            12 => .Q4_K,
             14 => .Q6_K,
             30 => .BF16,
             else => {
@@ -714,6 +715,7 @@ pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Self {
                 .Q4_0 => data_types.Q4_0 = true,
                 .Q4_1 => data_types.Q4_1 = true,
                 .Q6_K => data_types.Q6_K = true,
+                .Q4_K => data_types.Q4_K = true,
                 _ => {},
             }
         }
@@ -880,6 +882,7 @@ pub const DataTypeSet = struct {
     Q4_0: bool = false,
     Q4_1: bool = false,
     Q6_K: bool = false,
+    Q4_K: bool = false,
 
     pub const none: DataTypeSet = .{};
 };
