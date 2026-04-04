@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .infer_base = .{
-            .path = "../base",
+            .path = "git+https://github.com/infer-zero/base#3984600e5ba53ee63a3b910c9c9b3ef8ca9f8cc7",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
