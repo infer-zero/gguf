@@ -24,8 +24,10 @@ const TensorInfo = struct {
             1 => .FP16,
             2 => .Q4_0,
             3 => .Q4_1,
+            6 => .Q5_0,
             8 => .Q8_0,
             12 => .Q4_K,
+            13 => .Q5_K,
             14 => .Q6_K,
             30 => .BF16,
             else => {
@@ -536,6 +538,18 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
 
     var unknown_token: ?[]const u8 = null;
 
+    // GGUF token_type 3 = CONTROL (e.g. <|im_start|>, <|im_end|>),
+    // type 4 = USER_DEFINED. Both must land in `special_tokens` so the base
+    // tokenizer's `encode` splits them out before BPE; otherwise chat-template
+    // markers get BPE'd into ASCII pieces (`<` `|` `im` `_start` `|` `>`),
+    // turn boundaries are invisible, and the model never emits EOT.
+    var special_tokens: Vocabulary.SpecialTokens = .empty;
+    errdefer {
+        var sp_it = special_tokens.iterator();
+        while (sp_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        special_tokens.deinit(allocator);
+    }
+
     for (tokens, 0..) |token_val, idx| {
         const token_str = token_val.getString() orelse continue;
         const token_id: Vocabulary.TokenID = @intCast(idx);
@@ -548,16 +562,38 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
         try encoding.put(allocator, enc_key, token_id);
         try decoding.put(allocator, token_id, dec_val);
 
-        // Check if this is the unknown token (type == 2)
         if (token_types) |types| {
             if (idx < types.len) {
                 if (types[idx].getUint()) |token_type| {
-                    if (token_type == 2) {
-                        unknown_token = dec_val;
+                    switch (token_type) {
+                        2 => unknown_token = dec_val, // UNKNOWN
+                        3, 4 => { // CONTROL or USER_DEFINED
+                            const sp_key = try allocator.dupe(u8, token_str);
+                            errdefer allocator.free(sp_key);
+                            try special_tokens.put(allocator, sp_key, token_id);
+                        },
+                        else => {},
                     }
                 }
             }
         }
+    }
+
+    // Build sorted-by-length-descending list so longer tokens match first
+    // (e.g. "<|im_start|>" before "<|").
+    var special_sorted = try allocator.alloc(Vocabulary.SpecialTokenEntry, special_tokens.count());
+    errdefer allocator.free(special_sorted);
+    {
+        var i: usize = 0;
+        var sp_it = special_tokens.iterator();
+        while (sp_it.next()) |entry| : (i += 1) {
+            special_sorted[i] = .{ .text = entry.key_ptr.*, .id = entry.value_ptr.* };
+        }
+        std.mem.sort(Vocabulary.SpecialTokenEntry, special_sorted, {}, struct {
+            fn lessThan(_: void, a: Vocabulary.SpecialTokenEntry, b: Vocabulary.SpecialTokenEntry) bool {
+                return a.text.len > b.text.len;
+            }
+        }.lessThan);
     }
 
     // Build merge index
@@ -627,6 +663,8 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
         .unknown_token = unknown_token,
         .use_byte_level = use_byte_level,
         .post_processor = post_processor,
+        .special_tokens = special_tokens,
+        .special_tokens_sorted = special_sorted,
     };
 
     return .{
@@ -714,6 +752,8 @@ pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Self {
                 .Q8_0 => data_types.Q8_0 = true,
                 .Q4_0 => data_types.Q4_0 = true,
                 .Q4_1 => data_types.Q4_1 = true,
+                .Q5_0 => data_types.Q5_0 = true,
+                .Q5_K => data_types.Q5_K = true,
                 .Q6_K => data_types.Q6_K = true,
                 .Q4_K => data_types.Q4_K = true,
                 _ => {},
@@ -881,6 +921,8 @@ pub const DataTypeSet = struct {
     Q8_0: bool = false,
     Q4_0: bool = false,
     Q4_1: bool = false,
+    Q5_0: bool = false,
+    Q5_K: bool = false,
     Q6_K: bool = false,
     Q4_K: bool = false,
 
