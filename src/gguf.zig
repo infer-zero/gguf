@@ -675,6 +675,74 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
 
 // -- Public tensor reading --
 
+/// Parser-native data-type enum. Exactly mirrors the numeric values of
+/// `base.Tensor.DataType` so conversions between the two are a `@bitCast`
+/// away. Phase 6 will remove gguf's dependency on base, at which point the
+/// base-facing `getTensor` disappears and callers route through
+/// `getTensorRaw` + a harness adapter that wraps the raw bytes.
+pub const DataType = enum(u8) {
+    BF16 = 0,
+    FP32 = 1,
+    FP16 = 2,
+    Q8_0 = 3,
+    Q4_0 = 4,
+    Q6_K = 5,
+    Q4_1 = 6,
+    Q5_0 = 7,
+    Q4_K = 8,
+    Q5_K = 9,
+    _,
+};
+
+/// Minimal parser-native tensor view: just the raw bytes plus the dtype.
+/// No conversion methods, no dependency on base.
+pub const RawTensor = struct {
+    data_type: DataType,
+    data: []const u8,
+};
+
+/// Raw-bytes counterpart to `getTensor`. Returns the tensor's on-disk bytes
+/// plus its native `DataType` — no dependency on base. Caller owns the
+/// returned buffer (free with `allocator.free(raw.data)`).
+pub fn getTensorRaw(self: *Self, name: []const u8) !?RawTensor {
+    const allocator = self.allocator orelse {
+        log.err("gguf: getTensorRaw called without allocator", .{});
+        return error.IOError;
+    };
+
+    const info = self.tensor_infos.get(name) orelse return null;
+
+    const base_dtype = info.dataType() catch return error.IOError;
+    const byte_size = info.byteSize() catch return error.IOError;
+
+    const abs_offset = std.math.add(u64, self.data_offset, info.offset) catch return error.IOError;
+    const end_offset = std.math.add(u64, abs_offset, byte_size) catch return error.IOError;
+    const file_size = self.file.getEndPos() catch return error.IOError;
+    if (end_offset > file_size) return error.IOError;
+
+    self.file.seekTo(abs_offset) catch {
+        log.err("gguf: failed to seek to tensor '{s}' at offset {d}", .{ name, abs_offset });
+        return error.IOError;
+    };
+
+    const data = allocator.alloc(u8, @intCast(byte_size)) catch return error.OutOfMemory;
+    errdefer allocator.free(data);
+
+    const bytes_read = self.file.readAll(data) catch {
+        log.err("gguf: failed to read tensor '{s}' data", .{name});
+        return error.IOError;
+    };
+    if (bytes_read != @as(usize, @intCast(byte_size))) {
+        log.err("gguf: incomplete tensor read '{s}': got {d}, expected {d}", .{ name, bytes_read, byte_size });
+        return error.IOError;
+    }
+
+    return .{
+        .data_type = @enumFromInt(@intFromEnum(base_dtype)),
+        .data = data,
+    };
+}
+
 /// Read a tensor by name, returning its raw data and type. Returns null if not found.
 pub fn getTensor(self: *Self, name: []const u8) !?Tensor {
     const allocator = self.allocator orelse {
