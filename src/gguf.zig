@@ -5,7 +5,6 @@ allocator: ?std.mem.Allocator = null,
 meta: Meta,
 config_map: ConfigMap,
 parsed_tokenizer: ParsedTokenizer,
-parsed_tokenizer_ptr: *ParsedTokenizer,
 tensor_infos: TensorInfoMap,
 file: std.fs.File,
 data_offset: u64,
@@ -499,10 +498,7 @@ fn getMetadataGlobalUsize(metadata: *const MetadataMap, key: []const u8) ?usize 
 
 // -- Tokenizer extraction from metadata --
 
-fn extractParsedTokenizer(allocator: std.mem.Allocator, metadata: *const MetadataMap) !struct {
-    parsed_tokenizer_ptr: *ParsedTokenizer,
-    parsed_tokenizer: ParsedTokenizer,
-} {
+fn extractParsedTokenizer(allocator: std.mem.Allocator, metadata: *const MetadataMap) !ParsedTokenizer {
     // Get tokens array
     const tokens_val = metadata.get("tokenizer.ggml.tokens") orelse {
         log.err("gguf: missing 'tokenizer.ggml.tokens' metadata", .{});
@@ -655,8 +651,7 @@ fn extractParsedTokenizer(allocator: std.mem.Allocator, metadata: *const Metadat
         break :blk .{ .template = template };
     } else null;
 
-    const tok_ptr = try allocator.create(ParsedTokenizer);
-    tok_ptr.* = .{
+    return .{
         .encoding = encoding,
         .decoding = decoding,
         .merge_index = merge_index,
@@ -665,11 +660,6 @@ fn extractParsedTokenizer(allocator: std.mem.Allocator, metadata: *const Metadat
         .post_processor = post_processor,
         .special_tokens = special_tokens,
         .special_tokens_sorted = special_sorted,
-    };
-
-    return .{
-        .parsed_tokenizer_ptr = tok_ptr,
-        .parsed_tokenizer = tok_ptr.*,
     };
 }
 
@@ -1111,32 +1101,20 @@ pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Self {
         deinitConfigMap(&result.config_map, allocator);
     }
 
-    const tok_result = try extractParsedTokenizer(allocator, &parsed.metadata);
-    errdefer {
-        var enc_it = tok_result.parsed_tokenizer_ptr.encoding.iterator();
-        while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
-        tok_result.parsed_tokenizer_ptr.encoding.deinit(allocator);
-        var dec_it = tok_result.parsed_tokenizer_ptr.decoding.iterator();
-        while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
-        tok_result.parsed_tokenizer_ptr.decoding.deinit(allocator);
-        var merge_it = tok_result.parsed_tokenizer_ptr.merge_index.iterator();
-        while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
-        tok_result.parsed_tokenizer_ptr.merge_index.deinit(allocator);
-        allocator.destroy(tok_result.parsed_tokenizer_ptr);
-    }
+    var tok = try extractParsedTokenizer(allocator, &parsed.metadata);
+    errdefer freeParsedTokenizer(allocator, &tok);
 
     return Self{
         .meta = result.meta,
         .config_map = result.config_map,
-        .parsed_tokenizer = tok_result.parsed_tokenizer,
-        .parsed_tokenizer_ptr = tok_result.parsed_tokenizer_ptr,
+        .parsed_tokenizer = tok,
         .tensor_infos = parsed.tensor_infos,
         .file = file,
         .data_offset = parsed.data_offset,
     };
 }
 
-pub fn deinit(self: Self) void {
+pub fn deinit(self: *Self) void {
     const allocator = self.allocator orelse return;
 
     // Free meta
@@ -1144,35 +1122,39 @@ pub fn deinit(self: Self) void {
     allocator.free(self.meta.architectures);
 
     // Free config_map
-    var map = self.config_map;
-    deinitConfigMap(&map, allocator);
+    deinitConfigMap(&self.config_map, allocator);
 
-    // Free parsed tokenizer
-    var enc_it = self.parsed_tokenizer_ptr.encoding.iterator();
-    while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
-    self.parsed_tokenizer_ptr.encoding.deinit(allocator);
-
-    var dec_it = self.parsed_tokenizer_ptr.decoding.iterator();
-    while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
-    self.parsed_tokenizer_ptr.decoding.deinit(allocator);
-
-    var merge_it = self.parsed_tokenizer_ptr.merge_index.iterator();
-    while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
-    self.parsed_tokenizer_ptr.merge_index.deinit(allocator);
-
-    if (self.parsed_tokenizer_ptr.post_processor) |pp| {
-        switch (pp) {
-            .template => |template| allocator.free(template),
-            .sequence => |seq| allocator.free(seq),
-        }
-    }
-
-    allocator.destroy(self.parsed_tokenizer_ptr);
+    freeParsedTokenizer(allocator, &self.parsed_tokenizer);
 
     // Free tensor info keys
-    var ti_it = @constCast(&self.tensor_infos).iterator();
+    var ti_it = self.tensor_infos.iterator();
     while (ti_it.next()) |entry| allocator.free(entry.key_ptr.*);
-    @constCast(&self.tensor_infos).deinit(allocator);
+    self.tensor_infos.deinit(allocator);
+}
+
+fn freeParsedTokenizer(allocator: std.mem.Allocator, tok: *ParsedTokenizer) void {
+    var enc_it = tok.encoding.iterator();
+    while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
+    tok.encoding.deinit(allocator);
+
+    var dec_it = tok.decoding.iterator();
+    while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
+    tok.decoding.deinit(allocator);
+
+    var merge_it = tok.merge_index.iterator();
+    while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
+    tok.merge_index.deinit(allocator);
+
+    var sp_it = tok.special_tokens.iterator();
+    while (sp_it.next()) |entry| allocator.free(entry.key_ptr.*);
+    tok.special_tokens.deinit(allocator);
+
+    allocator.free(tok.special_tokens_sorted);
+
+    if (tok.post_processor) |pp| switch (pp) {
+        .template => |template| allocator.free(template),
+        .sequence => |seq| allocator.free(seq),
+    };
 }
 
 test {
@@ -1297,8 +1279,7 @@ pub fn deinitConfigMap(map: *ConfigMap, allocator: std.mem.Allocator) void {
 }
 
 /// Parser-native tokenizer data extracted from GGUF metadata. All strings
-/// and hashmap keys are owned by the parser's allocator. Phase 6b moved
-/// this out of `base.Vocabulary` so the parser no longer depends on base;
+/// and hashmap keys are owned by the parser's allocator.
 /// `harness/src/adapters.zig::vocabularyOwned` builds a fresh
 /// `base.Vocabulary` from this struct on demand.
 pub const ParsedTokenizer = struct {
