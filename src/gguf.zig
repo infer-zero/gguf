@@ -4,8 +4,8 @@ allocator: ?std.mem.Allocator = null,
 
 meta: Meta,
 config_map: ConfigMap,
-vocabulary: Vocabulary,
-vocabulary_ptr: *Vocabulary,
+parsed_tokenizer: ParsedTokenizer,
+parsed_tokenizer_ptr: *ParsedTokenizer,
 tensor_infos: TensorInfoMap,
 file: std.fs.File,
 data_offset: u64,
@@ -497,11 +497,11 @@ fn getMetadataGlobalUsize(metadata: *const MetadataMap, key: []const u8) ?usize 
     return null;
 }
 
-// -- Vocabulary extraction from metadata --
+// -- Tokenizer extraction from metadata --
 
-fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap) !struct {
-    vocabulary_ptr: *Vocabulary,
-    vocabulary: Vocabulary,
+fn extractParsedTokenizer(allocator: std.mem.Allocator, metadata: *const MetadataMap) !struct {
+    parsed_tokenizer_ptr: *ParsedTokenizer,
+    parsed_tokenizer: ParsedTokenizer,
 } {
     // Get tokens array
     const tokens_val = metadata.get("tokenizer.ggml.tokens") orelse {
@@ -523,13 +523,13 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
     };
 
     // Build encoding and decoding maps
-    var encoding: Vocabulary.EncodingVocabulary = .empty;
+    var encoding: ParsedTokenizer.EncodingMap = .empty;
     errdefer {
         var enc_it = encoding.iterator();
         while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
         encoding.deinit(allocator);
     }
-    var decoding: Vocabulary.DecodingVocabulary = .empty;
+    var decoding: ParsedTokenizer.DecodingMap = .empty;
     errdefer {
         var dec_it = decoding.iterator();
         while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
@@ -543,7 +543,7 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
     // tokenizer's `encode` splits them out before BPE; otherwise chat-template
     // markers get BPE'd into ASCII pieces (`<` `|` `im` `_start` `|` `>`),
     // turn boundaries are invisible, and the model never emits EOT.
-    var special_tokens: Vocabulary.SpecialTokens = .empty;
+    var special_tokens: ParsedTokenizer.SpecialTokenMap = .empty;
     errdefer {
         var sp_it = special_tokens.iterator();
         while (sp_it.next()) |entry| allocator.free(entry.key_ptr.*);
@@ -552,7 +552,7 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
 
     for (tokens, 0..) |token_val, idx| {
         const token_str = token_val.getString() orelse continue;
-        const token_id: Vocabulary.TokenID = @intCast(idx);
+        const token_id: ParsedTokenizer.TokenID = @intCast(idx);
 
         const enc_key = try allocator.dupe(u8, token_str);
         errdefer allocator.free(enc_key);
@@ -581,7 +581,7 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
 
     // Build sorted-by-length-descending list so longer tokens match first
     // (e.g. "<|im_start|>" before "<|").
-    var special_sorted = try allocator.alloc(Vocabulary.SpecialTokenEntry, special_tokens.count());
+    var special_sorted = try allocator.alloc(ParsedTokenizer.SpecialTokenEntry, special_tokens.count());
     errdefer allocator.free(special_sorted);
     {
         var i: usize = 0;
@@ -589,15 +589,15 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
         while (sp_it.next()) |entry| : (i += 1) {
             special_sorted[i] = .{ .text = entry.key_ptr.*, .id = entry.value_ptr.* };
         }
-        std.mem.sort(Vocabulary.SpecialTokenEntry, special_sorted, {}, struct {
-            fn lessThan(_: void, a: Vocabulary.SpecialTokenEntry, b: Vocabulary.SpecialTokenEntry) bool {
+        std.mem.sort(ParsedTokenizer.SpecialTokenEntry, special_sorted, {}, struct {
+            fn lessThan(_: void, a: ParsedTokenizer.SpecialTokenEntry, b: ParsedTokenizer.SpecialTokenEntry) bool {
                 return a.text.len > b.text.len;
             }
         }.lessThan);
     }
 
     // Build merge index
-    var merge_index: Vocabulary.MergePairIndex = .empty;
+    var merge_index: ParsedTokenizer.MergePairIndex = .empty;
     errdefer {
         var merge_it = merge_index.iterator();
         while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
@@ -645,18 +645,18 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
         break :blk true; // default: add BOS
     };
 
-    const post_processor: ?Vocabulary.PostProcessor = if (add_bos) blk: {
-        const bos_id: Vocabulary.TokenID = @intCast(
+    const post_processor: ?ParsedTokenizer.PostProcessor = if (add_bos) blk: {
+        const bos_id: ParsedTokenizer.TokenID = @intCast(
             getMetadataGlobalUsize(metadata, "tokenizer.ggml.bos_token_id") orelse 1,
         );
-        const template = try allocator.alloc(Vocabulary.PostProcessor.TemplateProcessing, 2);
+        const template = try allocator.alloc(ParsedTokenizer.PostProcessor.TemplateProcessing, 2);
         template[0] = .{ .special_token = bos_id };
         template[1] = .{ .sequence = {} };
         break :blk .{ .template = template };
     } else null;
 
-    const vocab_ptr = try allocator.create(Vocabulary);
-    vocab_ptr.* = .{
+    const tok_ptr = try allocator.create(ParsedTokenizer);
+    tok_ptr.* = .{
         .encoding = encoding,
         .decoding = decoding,
         .merge_index = merge_index,
@@ -668,8 +668,8 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
     };
 
     return .{
-        .vocabulary_ptr = vocab_ptr,
-        .vocabulary = vocab_ptr.*,
+        .parsed_tokenizer_ptr = tok_ptr,
+        .parsed_tokenizer = tok_ptr.*,
     };
 }
 
@@ -1111,25 +1111,25 @@ pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Self {
         deinitConfigMap(&result.config_map, allocator);
     }
 
-    const vocab_result = try extractVocabulary(allocator, &parsed.metadata);
+    const tok_result = try extractParsedTokenizer(allocator, &parsed.metadata);
     errdefer {
-        var enc_it = vocab_result.vocabulary_ptr.encoding.iterator();
+        var enc_it = tok_result.parsed_tokenizer_ptr.encoding.iterator();
         while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
-        vocab_result.vocabulary_ptr.encoding.deinit(allocator);
-        var dec_it = vocab_result.vocabulary_ptr.decoding.iterator();
+        tok_result.parsed_tokenizer_ptr.encoding.deinit(allocator);
+        var dec_it = tok_result.parsed_tokenizer_ptr.decoding.iterator();
         while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
-        vocab_result.vocabulary_ptr.decoding.deinit(allocator);
-        var merge_it = vocab_result.vocabulary_ptr.merge_index.iterator();
+        tok_result.parsed_tokenizer_ptr.decoding.deinit(allocator);
+        var merge_it = tok_result.parsed_tokenizer_ptr.merge_index.iterator();
         while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
-        vocab_result.vocabulary_ptr.merge_index.deinit(allocator);
-        allocator.destroy(vocab_result.vocabulary_ptr);
+        tok_result.parsed_tokenizer_ptr.merge_index.deinit(allocator);
+        allocator.destroy(tok_result.parsed_tokenizer_ptr);
     }
 
     return Self{
         .meta = result.meta,
         .config_map = result.config_map,
-        .vocabulary = vocab_result.vocabulary,
-        .vocabulary_ptr = vocab_result.vocabulary_ptr,
+        .parsed_tokenizer = tok_result.parsed_tokenizer,
+        .parsed_tokenizer_ptr = tok_result.parsed_tokenizer_ptr,
         .tensor_infos = parsed.tensor_infos,
         .file = file,
         .data_offset = parsed.data_offset,
@@ -1147,27 +1147,27 @@ pub fn deinit(self: Self) void {
     var map = self.config_map;
     deinitConfigMap(&map, allocator);
 
-    // Free vocabulary
-    var enc_it = self.vocabulary_ptr.encoding.iterator();
+    // Free parsed tokenizer
+    var enc_it = self.parsed_tokenizer_ptr.encoding.iterator();
     while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
-    self.vocabulary_ptr.encoding.deinit(allocator);
+    self.parsed_tokenizer_ptr.encoding.deinit(allocator);
 
-    var dec_it = self.vocabulary_ptr.decoding.iterator();
+    var dec_it = self.parsed_tokenizer_ptr.decoding.iterator();
     while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
-    self.vocabulary_ptr.decoding.deinit(allocator);
+    self.parsed_tokenizer_ptr.decoding.deinit(allocator);
 
-    var merge_it = self.vocabulary_ptr.merge_index.iterator();
+    var merge_it = self.parsed_tokenizer_ptr.merge_index.iterator();
     while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
-    self.vocabulary_ptr.merge_index.deinit(allocator);
+    self.parsed_tokenizer_ptr.merge_index.deinit(allocator);
 
-    if (self.vocabulary_ptr.post_processor) |pp| {
+    if (self.parsed_tokenizer_ptr.post_processor) |pp| {
         switch (pp) {
             .template => |template| allocator.free(template),
             .sequence => |seq| allocator.free(seq),
         }
     }
 
-    allocator.destroy(self.vocabulary_ptr);
+    allocator.destroy(self.parsed_tokenizer_ptr);
 
     // Free tensor info keys
     var ti_it = @constCast(&self.tensor_infos).iterator();
@@ -1195,9 +1195,9 @@ test {
     try testing.expectEqual(384, configGetUint(data.config_map, "feed_forward_length").?);
     try testing.expectEqual(2048, data.meta.vocabulary_size);
 
-    // Vocabulary
-    try testing.expectEqual(26, data.vocabulary.encoding.get("A").?);
-    try testing.expectEqualStrings("A", data.vocabulary.decoding.get(26).?);
+    // Parsed tokenizer
+    try testing.expectEqual(26, data.parsed_tokenizer.encoding.get("A").?);
+    try testing.expectEqualStrings("A", data.parsed_tokenizer.decoding.get(26).?);
 
     // Tensor reading (direct GGUF name)
     const embeddings = try data.getTensorRaw("token_embd.weight");
@@ -1296,7 +1296,52 @@ pub fn deinitConfigMap(map: *ConfigMap, allocator: std.mem.Allocator) void {
     map.deinit(allocator);
 }
 
-const Vocabulary = @import("base").Vocabulary;
+/// Parser-native tokenizer data extracted from GGUF metadata. All strings
+/// and hashmap keys are owned by the parser's allocator. Phase 6b moved
+/// this out of `base.Vocabulary` so the parser no longer depends on base;
+/// `harness/src/adapters.zig::vocabularyOwned` builds a fresh
+/// `base.Vocabulary` from this struct on demand.
+pub const ParsedTokenizer = struct {
+    encoding: EncodingMap,
+    decoding: DecodingMap,
+    merge_index: MergePairIndex,
+    special_tokens: SpecialTokenMap = .empty,
+    special_tokens_sorted: []const SpecialTokenEntry = &.{},
+    unknown_token: ?[]const u8 = null,
+    normalizer: ?Normalizer = null,
+    post_processor: ?PostProcessor = null,
+    use_byte_level: bool = false,
+
+    pub const TokenID = u32;
+    pub const EncodingMap = std.StringHashMapUnmanaged(TokenID);
+    pub const DecodingMap = std.AutoHashMapUnmanaged(TokenID, []const u8);
+    pub const MergePairIndex = std.StringHashMapUnmanaged(usize);
+    pub const SpecialTokenMap = std.StringHashMapUnmanaged(TokenID);
+
+    pub const SpecialTokenEntry = struct {
+        text: []const u8,
+        id: TokenID,
+    };
+
+    pub const Normalizer = union(enum) {
+        sequence: []const Normalizer,
+        prepend: []const u8,
+        replace: struct {
+            pattern: []const u8,
+            content: []const u8,
+        },
+    };
+
+    pub const PostProcessor = union(enum) {
+        sequence: []const PostProcessor,
+        template: []const TemplateProcessing,
+
+        pub const TemplateProcessing = union(enum) {
+            sequence: void,
+            special_token: TokenID,
+        };
+    };
+};
 
 const log = std.log.scoped(.infer);
 
