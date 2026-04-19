@@ -18,7 +18,7 @@ const TensorInfo = struct {
     gguf_type: u32,
     offset: u64,
 
-    fn dataType(self: TensorInfo) !Tensor.DataType {
+    fn dataType(self: TensorInfo) !DataType {
         return switch (self.gguf_type) {
             0 => .FP32,
             1 => .FP16,
@@ -676,10 +676,10 @@ fn extractVocabulary(allocator: std.mem.Allocator, metadata: *const MetadataMap)
 // -- Public tensor reading --
 
 /// Parser-native data-type enum. Exactly mirrors the numeric values of
-/// `base.Tensor.DataType` so conversions between the two are a `@bitCast`
-/// away. Phase 6 will remove gguf's dependency on base, at which point the
-/// base-facing `getTensor` disappears and callers route through
-/// `getTensorRaw` + a harness adapter that wraps the raw bytes.
+/// `base.Tensor.DataType` so conversions between the two are a single
+/// `@enumFromInt(@intFromEnum(...))` cast (used by `harness.adapters`).
+/// The parser no longer depends on base — callers route through
+/// `getTensorRaw` and wrap the raw bytes via a harness adapter.
 pub const DataType = enum(u8) {
     BF16 = 0,
     FP32 = 1,
@@ -692,6 +692,331 @@ pub const DataType = enum(u8) {
     Q4_K = 8,
     Q5_K = 9,
     _,
+
+    pub fn byteSize(self: @This(), num_elements: usize) error{Overflow}!usize {
+        return switch (self) {
+            .BF16, .FP16 => std.math.mul(usize, num_elements, 2),
+            .FP32 => std.math.mul(usize, num_elements, 4),
+            .Q8_0 => std.math.mul(usize, num_elements / Q8_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES),
+            .Q4_0 => std.math.mul(usize, num_elements / Q4_0_BLOCK_SIZE, Q4_0_BLOCK_BYTES),
+            .Q4_1 => std.math.mul(usize, num_elements / Q4_1_BLOCK_SIZE, Q4_1_BLOCK_BYTES),
+            .Q5_0 => std.math.mul(usize, num_elements / Q5_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES),
+            .Q5_K => std.math.mul(usize, num_elements / Q5_K_BLOCK_SIZE, Q5_K_BLOCK_BYTES),
+            .Q6_K => std.math.mul(usize, num_elements / Q6_K_BLOCK_SIZE, Q6_K_BLOCK_BYTES),
+            .Q4_K => std.math.mul(usize, num_elements / Q4_K_BLOCK_SIZE, Q4_K_BLOCK_BYTES),
+            else => unreachable,
+        };
+    }
+
+    pub fn numElements(self: @This(), num_bytes: usize) usize {
+        return switch (self) {
+            .BF16, .FP16 => num_bytes / 2,
+            .FP32 => num_bytes / 4,
+            .Q8_0 => (num_bytes / Q8_0_BLOCK_BYTES) * Q8_0_BLOCK_SIZE,
+            .Q4_0 => (num_bytes / Q4_0_BLOCK_BYTES) * Q4_0_BLOCK_SIZE,
+            .Q4_1 => (num_bytes / Q4_1_BLOCK_BYTES) * Q4_1_BLOCK_SIZE,
+            .Q5_0 => (num_bytes / Q5_0_BLOCK_BYTES) * Q5_0_BLOCK_SIZE,
+            .Q5_K => (num_bytes / Q5_K_BLOCK_BYTES) * Q5_K_BLOCK_SIZE,
+            .Q6_K => (num_bytes / Q6_K_BLOCK_BYTES) * Q6_K_BLOCK_SIZE,
+            .Q4_K => (num_bytes / Q4_K_BLOCK_BYTES) * Q4_K_BLOCK_SIZE,
+            else => unreachable,
+        };
+    }
+
+    pub fn toF32(self: @This(), allocator: std.mem.Allocator, data: []const u8) ![]const f32 {
+        switch (self) {
+            .BF16 => {
+                if (data.len % 2 != 0) return error.InvalidData;
+                const bf16_data: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, data));
+                const result = try allocator.alloc(f32, bf16_data.len);
+                for (bf16_data, 0..) |bf16, idx| {
+                    const bits: u32 = @as(u32, bf16) << 16;
+                    result[idx] = @bitCast(bits);
+                }
+                return result;
+            },
+            .FP32 => {
+                if (data.len % 4 != 0) return error.InvalidData;
+                const f32_data: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, data));
+                return try allocator.dupe(f32, f32_data);
+            },
+            .FP16 => {
+                if (data.len % 2 != 0) return error.InvalidData;
+                const f16_data: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, data));
+                const result = try allocator.alloc(f32, f16_data.len);
+                for (f16_data, 0..) |f16_val, idx| {
+                    result[idx] = @floatCast(f16_val);
+                }
+                return result;
+            },
+            .Q8_0 => {
+                if (data.len % Q8_0_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q8_0_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q8_0_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+                    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    for (0..Q8_0_BLOCK_SIZE) |elem| {
+                        result[block_idx * Q8_0_BLOCK_SIZE + elem] = scale * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + elem]))));
+                    }
+                }
+                return result;
+            },
+            .Q4_0 => {
+                if (data.len % Q4_0_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q4_0_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q4_0_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q4_0_BLOCK_BYTES ..][0..Q4_0_BLOCK_BYTES];
+                    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    for (0..Q4_0_BLOCK_SIZE / 2) |j| {
+                        const byte = block[2 + j];
+                        const low: i8 = @as(i8, @intCast(byte & 0x0F)) - 8;
+                        const high: i8 = @as(i8, @intCast(byte >> 4)) - 8;
+                        result[block_idx * Q4_0_BLOCK_SIZE + j] = scale * @as(f32, @floatFromInt(low));
+                        result[block_idx * Q4_0_BLOCK_SIZE + j + Q4_0_BLOCK_SIZE / 2] = scale * @as(f32, @floatFromInt(high));
+                    }
+                }
+                return result;
+            },
+            .Q4_1 => {
+                if (data.len % Q4_1_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q4_1_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q4_1_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q4_1_BLOCK_BYTES ..][0..Q4_1_BLOCK_BYTES];
+                    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    const min: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[2..4], .little))));
+                    for (0..Q4_1_BLOCK_SIZE / 2) |j| {
+                        const byte = block[4 + j];
+                        const low: f32 = @floatFromInt(@as(u8, byte & 0x0F));
+                        const high: f32 = @floatFromInt(@as(u8, byte >> 4));
+                        result[block_idx * Q4_1_BLOCK_SIZE + j] = low * scale + min;
+                        result[block_idx * Q4_1_BLOCK_SIZE + j + Q4_1_BLOCK_SIZE / 2] = high * scale + min;
+                    }
+                }
+                return result;
+            },
+            .Q5_0 => {
+                if (data.len % Q5_0_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q5_0_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q5_0_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q5_0_BLOCK_BYTES ..][0..Q5_0_BLOCK_BYTES];
+                    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    const qh: u32 = std.mem.readInt(u32, block[2..6], .little);
+                    for (0..Q5_0_BLOCK_SIZE / 2) |j| {
+                        const byte = block[6 + j];
+                        const low5: i8 = @as(i8, @intCast((byte & 0x0F) | (if ((qh >> @intCast(j)) & 1 != 0) @as(u8, 0x10) else 0))) - 16;
+                        const high5: i8 = @as(i8, @intCast((byte >> 4) | (if ((qh >> @intCast(j + 16)) & 1 != 0) @as(u8, 0x10) else 0))) - 16;
+                        result[block_idx * Q5_0_BLOCK_SIZE + j] = scale * @as(f32, @floatFromInt(low5));
+                        result[block_idx * Q5_0_BLOCK_SIZE + j + Q5_0_BLOCK_SIZE / 2] = scale * @as(f32, @floatFromInt(high5));
+                    }
+                }
+                return result;
+            },
+            .Q6_K => {
+                if (data.len % Q6_K_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q6_K_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q6_K_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q6_K_BLOCK_BYTES ..][0..Q6_K_BLOCK_BYTES];
+                    const ql_base = block[0..128];
+                    const qh_base = block[128..192];
+                    const sc_base: *const [16]i8 = @ptrCast(block[192..208]);
+                    const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[208..210], .little))));
+                    const out = result[block_idx * Q6_K_BLOCK_SIZE ..][0..Q6_K_BLOCK_SIZE];
+
+                    inline for (0..2) |group| {
+                        const ql = ql_base[group * 64 ..];
+                        const qh = qh_base[group * 32 ..];
+                        const y_off = group * 128;
+                        const sc_off = group * 8;
+
+                        for (0..32) |l| {
+                            const is: usize = l / 16;
+                            const q1: i32 = @as(i32, (ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                            const q2: i32 = @as(i32, (ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                            const q3: i32 = @as(i32, (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                            const q4: i32 = @as(i32, (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                            out[y_off + l + 0] = d * @as(f32, @floatFromInt(sc_base[sc_off + is + 0])) * @as(f32, @floatFromInt(q1));
+                            out[y_off + l + 32] = d * @as(f32, @floatFromInt(sc_base[sc_off + is + 2])) * @as(f32, @floatFromInt(q2));
+                            out[y_off + l + 64] = d * @as(f32, @floatFromInt(sc_base[sc_off + is + 4])) * @as(f32, @floatFromInt(q3));
+                            out[y_off + l + 96] = d * @as(f32, @floatFromInt(sc_base[sc_off + is + 6])) * @as(f32, @floatFromInt(q4));
+                        }
+                    }
+                }
+                return result;
+            },
+            .Q4_K => {
+                if (data.len % Q4_K_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q4_K_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q4_K_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q4_K_BLOCK_BYTES ..][0..Q4_K_BLOCK_BYTES];
+                    const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    const dmin: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[2..4], .little))));
+                    const scales_raw = block[4..16];
+                    const qs = block[16..144];
+                    const out = result[block_idx * Q4_K_BLOCK_SIZE ..][0..Q4_K_BLOCK_SIZE];
+
+                    var scales_arr: [8]u8 = undefined;
+                    var mins_arr: [8]u8 = undefined;
+
+                    scales_arr[0] = scales_raw[0] & 0x3F;
+                    scales_arr[1] = scales_raw[1] & 0x3F;
+                    scales_arr[2] = scales_raw[2] & 0x3F;
+                    scales_arr[3] = scales_raw[3] & 0x3F;
+                    mins_arr[0] = scales_raw[4] & 0x3F;
+                    mins_arr[1] = scales_raw[5] & 0x3F;
+                    mins_arr[2] = scales_raw[6] & 0x3F;
+                    mins_arr[3] = scales_raw[7] & 0x3F;
+                    scales_arr[4] = (scales_raw[8] & 0x0F) | ((scales_raw[0] >> 6) << 4);
+                    scales_arr[5] = (scales_raw[9] & 0x0F) | ((scales_raw[1] >> 6) << 4);
+                    scales_arr[6] = (scales_raw[10] & 0x0F) | ((scales_raw[2] >> 6) << 4);
+                    scales_arr[7] = (scales_raw[11] & 0x0F) | ((scales_raw[3] >> 6) << 4);
+                    mins_arr[4] = (scales_raw[8] >> 4) | ((scales_raw[4] >> 6) << 4);
+                    mins_arr[5] = (scales_raw[9] >> 4) | ((scales_raw[5] >> 6) << 4);
+                    mins_arr[6] = (scales_raw[10] >> 4) | ((scales_raw[6] >> 6) << 4);
+                    mins_arr[7] = (scales_raw[11] >> 4) | ((scales_raw[7] >> 6) << 4);
+
+                    for (0..4) |j| {
+                        const sc1: f32 = d * @as(f32, @floatFromInt(scales_arr[j * 2]));
+                        const m1: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j * 2]));
+                        const sc2: f32 = d * @as(f32, @floatFromInt(scales_arr[j * 2 + 1]));
+                        const m2: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j * 2 + 1]));
+                        const q_base = qs[j * 32 ..];
+                        const out_base = out[j * 64 ..];
+                        for (0..32) |l| {
+                            out_base[l] = sc1 * @as(f32, @floatFromInt(q_base[l] & 0x0F)) - m1;
+                            out_base[l + 32] = sc2 * @as(f32, @floatFromInt(q_base[l] >> 4)) - m2;
+                        }
+                    }
+                }
+                return result;
+            },
+            .Q5_K => {
+                if (data.len % Q5_K_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q5_K_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q5_K_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q5_K_BLOCK_BYTES ..][0..Q5_K_BLOCK_BYTES];
+                    const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    const dmin: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[2..4], .little))));
+                    const scales_raw = block[4..16];
+                    const qh = block[16..48];
+                    const qs = block[48..176];
+                    const out = result[block_idx * Q5_K_BLOCK_SIZE ..][0..Q5_K_BLOCK_SIZE];
+
+                    var scales_arr: [8]u8 = undefined;
+                    var mins_arr: [8]u8 = undefined;
+                    scales_arr[0] = scales_raw[0] & 0x3F;
+                    scales_arr[1] = scales_raw[1] & 0x3F;
+                    scales_arr[2] = scales_raw[2] & 0x3F;
+                    scales_arr[3] = scales_raw[3] & 0x3F;
+                    mins_arr[0] = scales_raw[4] & 0x3F;
+                    mins_arr[1] = scales_raw[5] & 0x3F;
+                    mins_arr[2] = scales_raw[6] & 0x3F;
+                    mins_arr[3] = scales_raw[7] & 0x3F;
+                    scales_arr[4] = (scales_raw[8] & 0x0F) | ((scales_raw[0] >> 6) << 4);
+                    scales_arr[5] = (scales_raw[9] & 0x0F) | ((scales_raw[1] >> 6) << 4);
+                    scales_arr[6] = (scales_raw[10] & 0x0F) | ((scales_raw[2] >> 6) << 4);
+                    scales_arr[7] = (scales_raw[11] & 0x0F) | ((scales_raw[3] >> 6) << 4);
+                    mins_arr[4] = (scales_raw[8] >> 4) | ((scales_raw[4] >> 6) << 4);
+                    mins_arr[5] = (scales_raw[9] >> 4) | ((scales_raw[5] >> 6) << 4);
+                    mins_arr[6] = (scales_raw[10] >> 4) | ((scales_raw[6] >> 6) << 4);
+                    mins_arr[7] = (scales_raw[11] >> 4) | ((scales_raw[7] >> 6) << 4);
+
+                    for (0..4) |j| {
+                        const sc1: f32 = d * @as(f32, @floatFromInt(scales_arr[j]));
+                        const m1: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j]));
+                        const sc2: f32 = d * @as(f32, @floatFromInt(scales_arr[j + 4]));
+                        const m2: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j + 4]));
+                        const q_base = qs[j * 32 ..];
+                        const out_base = out[j * 64 ..];
+                        for (0..32) |l| {
+                            const qh_lo: u5 = @intCast((qh[l] >> @intCast(j)) & 1);
+                            const qh_hi: u5 = @intCast((qh[l] >> @intCast(j + 4)) & 1);
+                            const lo5 = (q_base[l] & 0x0F) | (qh_lo << 4);
+                            const hi5 = (q_base[l] >> 4) | (qh_hi << 4);
+                            out_base[l] = sc1 * @as(f32, @floatFromInt(lo5)) - m1;
+                            out_base[l + 32] = sc2 * @as(f32, @floatFromInt(hi5)) - m2;
+                        }
+                    }
+                }
+                return result;
+            },
+            else => {
+                log.err("unsupported data type for F32 conversion: {d}", .{@intFromEnum(self)});
+                return error.UnsupportedDataType;
+            },
+        }
+    }
+
+    pub fn toF16(self: @This(), allocator: std.mem.Allocator, data: []const u8) ![]const f16 {
+        switch (self) {
+            .BF16 => {
+                if (data.len % 2 != 0) return error.InvalidData;
+                const bf16_data: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, data));
+                const result = try allocator.alloc(f16, bf16_data.len);
+                for (bf16_data, 0..) |bf16, idx| {
+                    const bits: u32 = @as(u32, bf16) << 16;
+                    const f32_val: f32 = @bitCast(bits);
+                    result[idx] = @floatCast(f32_val);
+                }
+                return result;
+            },
+            .FP32 => {
+                if (data.len % 4 != 0) return error.InvalidData;
+                const f32_data: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, data));
+                const result = try allocator.alloc(f16, f32_data.len);
+                for (f32_data, 0..) |f32_val, idx| {
+                    result[idx] = @floatCast(f32_val);
+                }
+                return result;
+            },
+            .FP16 => {
+                if (data.len % 2 != 0) return error.InvalidData;
+                const f16_data: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, data));
+                return try allocator.dupe(f16, f16_data);
+            },
+            .Q8_0, .Q4_0, .Q4_1, .Q5_0, .Q6_K, .Q4_K, .Q5_K => {
+                const f32_data = try self.toF32(allocator, data);
+                defer allocator.free(f32_data);
+                const result = try allocator.alloc(f16, f32_data.len);
+                for (f32_data, 0..) |f32_val, idx| {
+                    result[idx] = @floatCast(f32_val);
+                }
+                return result;
+            },
+            else => {
+                log.err("unsupported data type for F16 conversion: {d}", .{@intFromEnum(self)});
+                return error.UnsupportedDataType;
+            },
+        }
+    }
+
+    const Q8_0_BLOCK_SIZE = 32;
+    const Q8_0_BLOCK_BYTES = 2 + Q8_0_BLOCK_SIZE;
+
+    const Q4_0_BLOCK_SIZE = 32;
+    const Q4_0_BLOCK_BYTES = 2 + Q4_0_BLOCK_SIZE / 2;
+
+    const Q4_1_BLOCK_SIZE = 32;
+    const Q4_1_BLOCK_BYTES = 2 + 2 + Q4_1_BLOCK_SIZE / 2;
+
+    const Q5_0_BLOCK_SIZE = 32;
+    const Q5_0_BLOCK_BYTES = 2 + 4 + Q5_0_BLOCK_SIZE / 2;
+
+    const Q5_K_BLOCK_SIZE = 256;
+    const Q5_K_BLOCK_BYTES = 2 + 2 + 12 + 32 + 128;
+
+    const Q6_K_BLOCK_SIZE = 256;
+    const Q6_K_BLOCK_BYTES = 128 + 64 + 16 + 2;
+
+    const Q4_K_BLOCK_SIZE = 256;
+    const Q4_K_BLOCK_BYTES = 2 + 2 + 12 + 128;
 };
 
 /// Minimal parser-native tensor view: just the raw bytes plus the dtype.
@@ -701,9 +1026,9 @@ pub const RawTensor = struct {
     data: []const u8,
 };
 
-/// Raw-bytes counterpart to `getTensor`. Returns the tensor's on-disk bytes
-/// plus its native `DataType` — no dependency on base. Caller owns the
-/// returned buffer (free with `allocator.free(raw.data)`).
+/// Return the tensor's on-disk bytes plus its native `DataType` — no
+/// dependency on base. Caller owns the returned buffer (free with
+/// `allocator.free(raw.data)`).
 pub fn getTensorRaw(self: *Self, name: []const u8) !?RawTensor {
     const allocator = self.allocator orelse {
         log.err("gguf: getTensorRaw called without allocator", .{});
@@ -712,7 +1037,7 @@ pub fn getTensorRaw(self: *Self, name: []const u8) !?RawTensor {
 
     const info = self.tensor_infos.get(name) orelse return null;
 
-    const base_dtype = info.dataType() catch return error.IOError;
+    const data_type = info.dataType() catch return error.IOError;
     const byte_size = info.byteSize() catch return error.IOError;
 
     const abs_offset = std.math.add(u64, self.data_offset, info.offset) catch return error.IOError;
@@ -738,60 +1063,9 @@ pub fn getTensorRaw(self: *Self, name: []const u8) !?RawTensor {
     }
 
     return .{
-        .data_type = @enumFromInt(@intFromEnum(base_dtype)),
-        .data = data,
-    };
-}
-
-/// Read a tensor by name, returning its raw data and type. Returns null if not found.
-pub fn getTensor(self: *Self, name: []const u8) !?Tensor {
-    const allocator = self.allocator orelse {
-        log.err("gguf: getTensor called without allocator", .{});
-        return error.IOError;
-    };
-
-    const info = self.tensor_infos.get(name) orelse return null;
-
-    const data_type = info.dataType() catch return error.IOError;
-    const byte_size = info.byteSize() catch return error.IOError;
-
-    // Seek to the tensor data (checked arithmetic to prevent overflow from malicious offsets)
-    const abs_offset = std.math.add(u64, self.data_offset, info.offset) catch return error.IOError;
-    const end_offset = std.math.add(u64, abs_offset, byte_size) catch return error.IOError;
-    const file_size = self.file.getEndPos() catch return error.IOError;
-    if (end_offset > file_size) return error.IOError;
-
-    self.file.seekTo(abs_offset) catch {
-        log.err("gguf: failed to seek to tensor '{s}' at offset {d}", .{ name, abs_offset });
-        return error.IOError;
-    };
-
-    // Read the data
-    const data = allocator.alloc(u8, @intCast(byte_size)) catch return error.OutOfMemory;
-    errdefer allocator.free(data);
-
-    const bytes_read = self.file.readAll(data) catch {
-        log.err("gguf: failed to read tensor '{s}' data", .{name});
-        return error.IOError;
-    };
-    if (bytes_read != @as(usize, @intCast(byte_size))) {
-        log.err("gguf: tensor '{s}' read incomplete: got {d}/{d} bytes", .{ name, bytes_read, byte_size });
-        return error.IOError;
-    }
-
-    return Tensor{
         .data_type = data_type,
         .data = data,
     };
-}
-
-/// Free a tensor previously returned by getTensor.
-pub fn releaseTensor(self: *Self, tensor: ?Tensor) void {
-    if (tensor) |tens| {
-        if (self.allocator) |allocator| {
-            tens.deinit(allocator);
-        }
-    }
 }
 
 // -- Public interface --
@@ -926,10 +1200,10 @@ test {
     try testing.expectEqualStrings("A", data.vocabulary.decoding.get(26).?);
 
     // Tensor reading (direct GGUF name)
-    const embeddings = try data.getTensor("token_embd.weight");
-    defer data.releaseTensor(embeddings);
+    const embeddings = try data.getTensorRaw("token_embd.weight");
+    defer testing.allocator.free(embeddings.?.data);
 
-    const embeddings_f32 = try embeddings.?.toF32(testing.allocator);
+    const embeddings_f32 = try embeddings.?.data_type.toF32(testing.allocator, embeddings.?.data);
     defer testing.allocator.free(embeddings_f32);
 
     try testing.expectEqual(embeddings.?.data.len, embeddings_f32.len * 2);
@@ -947,14 +1221,14 @@ test "Q8_0 GGUF loading" {
     try testing.expectEqual(128, configGetUint(data.config_map, "embedding_length").?);
 
     // Read a Q8_0 weight tensor
-    const q_proj = try data.getTensor("blk.0.attn_q.weight");
-    defer data.releaseTensor(q_proj);
+    const q_proj = try data.getTensorRaw("blk.0.attn_q.weight");
+    defer testing.allocator.free(q_proj.?.data);
 
     try testing.expect(q_proj != null);
-    try testing.expectEqual(Tensor.DataType.Q8_0, q_proj.?.data_type);
+    try testing.expectEqual(DataType.Q8_0, q_proj.?.data_type);
 
     // Verify dequantization to F32
-    const f32_data = try q_proj.?.toF32(testing.allocator);
+    const f32_data = try q_proj.?.data_type.toF32(testing.allocator, q_proj.?.data);
     defer testing.allocator.free(f32_data);
     // 128 * 128 = 16384 elements
     try testing.expectEqual(16384, f32_data.len);
@@ -1023,7 +1297,6 @@ pub fn deinitConfigMap(map: *ConfigMap, allocator: std.mem.Allocator) void {
 }
 
 const Vocabulary = @import("base").Vocabulary;
-const Tensor = @import("base").Tensor;
 
 const log = std.log.scoped(.infer);
 
