@@ -52,17 +52,17 @@ pub const Info = struct {
 };
 
 /// A tensor's on-disk bytes plus its element type. Dequant via
-/// `base.Tensor.toF32`/`toF16` after wrapping with
+/// `runtime.Tensor.toF32`/`toF16` after wrapping with
 /// `harness/src/adapters.zig::rawToTensor`.
 pub const Raw = struct {
     data_type: DataType,
     data: []const u8,
 };
 
-/// Tensor element type. Numeric values mirror `base.Tensor.DataType`
+/// Tensor element type. Numeric values mirror `runtime.Tensor.DataType`
 /// so `@enumFromInt(@intFromEnum(x))` converts between the two — see
 /// `harness/src/adapters.zig::rawToTensor`, which is how consumers
-/// reach a dequantizable `base.Tensor`.
+/// reach a dequantizable `runtime.Tensor`.
 pub const DataType = enum(u8) {
     BF16 = 0,
     FP32 = 1,
