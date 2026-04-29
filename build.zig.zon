@@ -2,7 +2,7 @@
     .name = .gguf,
     .fingerprint = 0x3cb484dddcb8b3a2,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

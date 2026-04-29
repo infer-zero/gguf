@@ -12,9 +12,9 @@ config: Config,
 tokenizer: Tokenizer,
 tensors: Tensors,
 
-pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Self {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !Self {
     var buffer: [4096]u8 = undefined;
-    var file_reader = file.reader(&buffer);
+    var file_reader = file.reader(io, &buffer);
     const reader = &file_reader.interface;
 
     const header = try Header.init(reader);
@@ -30,7 +30,7 @@ pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Self {
         break :blk default_alignment;
     };
 
-    var tensors = try Tensors.init(allocator, &file_reader, alignment, header.tensor_count);
+    var tensors = try Tensors.init(io, allocator, &file_reader, alignment, header.tensor_count);
     errdefer tensors.deinit();
 
     var config = try Config.init(allocator, metadata);
@@ -63,10 +63,11 @@ pub fn getTensorRaw(self: *Self, name: []const u8) !?Tensors.Raw {
 }
 
 test "F16 GGUF loading" {
-    const file = try std.fs.cwd().openFile("test_models/TinyStories-656K-GGUF/TinyStories-656K.f16.gguf", .{});
-    defer file.close();
+    const io = testing.io;
+    const file = try std.Io.Dir.cwd().openFile(io, "test_models/TinyStories-656K-GGUF/TinyStories-656K.f16.gguf", .{});
+    defer file.close(io);
 
-    var parser = try init(testing.allocator, file);
+    var parser = try init(io, testing.allocator, file);
     defer parser.deinit();
 
     try testing.expectEqual(1, parser.config.architectures.len);
@@ -86,10 +87,11 @@ test "F16 GGUF loading" {
 }
 
 test "Q8_0 GGUF loading" {
-    const file = try std.fs.cwd().openFile("test_models/TinyStories-656K-Q8_0-GGUF/tinystories-656k-q8_0.gguf", .{});
-    defer file.close();
+    const io = testing.io;
+    const file = try std.Io.Dir.cwd().openFile(io, "test_models/TinyStories-656K-Q8_0-GGUF/tinystories-656k-q8_0.gguf", .{});
+    defer file.close(io);
 
-    var parser = try init(testing.allocator, file);
+    var parser = try init(io, testing.allocator, file);
     defer parser.deinit();
 
     try testing.expectEqual(2, parser.metadata.get("llama.block_count").?.getUint().?);

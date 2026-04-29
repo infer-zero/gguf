@@ -5,9 +5,10 @@
 //! The file handle is borrowed — the caller is responsible for closing
 //! it.
 
+io: std.Io,
 allocator: std.mem.Allocator,
 map: Map,
-file: std.fs.File,
+file: std.Io.File,
 data_offset: u64,
 
 pub const Map = std.StringHashMapUnmanaged(Info);
@@ -117,12 +118,14 @@ pub const DataType = enum(u8) {
 /// aligned start of the tensor-data section using `alignment` and the
 /// reader's current logical position.
 pub fn init(
+    io: std.Io,
     allocator: std.mem.Allocator,
-    file_reader: *std.fs.File.Reader,
+    file_reader: *std.Io.File.Reader,
     alignment: u64,
     tensor_count: u64,
 ) !@This() {
     var self: @This() = .{
+        .io = io,
         .allocator = allocator,
         .map = .empty,
         .file = file_reader.file,
@@ -181,19 +184,14 @@ pub fn get(self: *@This(), name: []const u8) !?Raw {
 
     const abs_offset = std.math.add(u64, self.data_offset, info.offset) catch return error.IOError;
     const end_offset = std.math.add(u64, abs_offset, byte_size) catch return error.IOError;
-    const file_size = self.file.getEndPos() catch return error.IOError;
+    const file_size = self.file.length(self.io) catch return error.IOError;
     if (end_offset > file_size) return error.IOError;
-
-    self.file.seekTo(abs_offset) catch {
-        log.err("gguf: failed to seek to tensor '{s}' at offset {d}", .{ name, abs_offset });
-        return error.IOError;
-    };
 
     const data = self.allocator.alloc(u8, @intCast(byte_size)) catch return error.OutOfMemory;
     errdefer self.allocator.free(data);
 
-    const bytes_read = self.file.readAll(data) catch {
-        log.err("gguf: failed to read tensor '{s}' data", .{name});
+    const bytes_read = self.file.readPositionalAll(self.io, data, abs_offset) catch {
+        log.err("gguf: failed to read tensor '{s}' at offset {d}", .{ name, abs_offset });
         return error.IOError;
     };
     if (bytes_read != @as(usize, @intCast(byte_size))) {
